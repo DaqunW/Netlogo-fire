@@ -1,0 +1,658 @@
+extensions [gis table]
+
+
+globals [
+  buildings-dataset    ; 建筑物GIS数据
+  road-width-map       ; 存储每个道路瓦片的宽度信息的矩阵
+  inaccessible-areas   ; 消防车无法到达的区域
+  covered-buildings    ; 被消防车覆盖到的建筑物
+  total-buildings      ; 建筑物总数
+  firetruck-width      ; 消防车宽度(米)
+  coverage-radius      ; 覆盖半径(米)
+  simulation-running?  ; 模拟是否运行中
+  travel-time          ; 当前模拟的时间
+  experiment-results   ; 实验结果
+ 
+
+]
+
+breed [firetrucks firetruck]  ; 消防车智能体
+breed [buildings building]    ; 建筑物智能体
+
+patches-own [
+  IsBuilding?         ; 是否是建筑物
+  road-width           ; 道路宽度(米)
+  is-accessible?       ; 消防车是否可以到达
+  is-visited?          ; 是否被消防车访问过
+  distance-from-path   ; 到消防车路径的距离
+  is-fire?        ; 是否是火灾点
+]
+
+firetrucks-own [
+  path                 ; 存储消防车走过的路径
+  arrival-time    ; 到达时间
+]
+
+buildings-own [
+  building-id          ; 建筑物ID
+  is-covered?          ; 是否被消防车覆盖
+]
+
+;; 初始化模型
+to setup
+  ; 设置全局变量
+  set firetruck-width 4       ; 消防车宽度为4米
+  set coverage-radius 2       ; 覆盖半径，这里可改
+  set inaccessible-areas 0
+  set covered-buildings 0
+
+  ; 加载GIS数据
+  setup-gis
+
+  ; 初始化瓦片属性
+  ask patches [
+    set IsBuilding? false
+    set road-width 0
+    set is-accessible? false
+    set is-visited? false
+    set distance-from-path 999
+    set pcolor white
+  ]
+
+  ; 处理道路宽度，函数见下
+  process-road-widths
+  print (word "road-width processed finished")
+  
+  ; 新加的，初始化火灾和消防车相关变量
+  ask patches [
+    set is-fire? false
+  ]
+  
+  set simulation-running? false
+  set travel-time 0
+  
+  reset-ticks
+end
+
+;  ; 创建消防车
+;  create-firetrucks 1 [
+;    set shape "truck"
+;    set color red
+;    set size 5
+;    move-to one-of patches with [IsBuilding? != 1 and road-width >= firetruck-width]
+;    set path (list patch-here)
+;  ]
+;
+;  ; 标记初始可达区域，函数见下
+;  print (word "Start mark initial access area")
+;  update-accessibility
+;
+;
+;  ; 计算建筑物总数
+;  set total-buildings count buildings
+
+
+;; 加载GIS数据
+to setup-gis
+  clear-all
+  ; 假设GIS数据已经转换为相对坐标系统，适合NetLogo使用
+  set buildings-dataset gis:load-dataset "buildings_50N_ext.shp"
+  gis:set-drawing-color gray
+  gis:fill buildings-dataset 0.5
+
+  let feature one-of gis:feature-list-of buildings-dataset
+  let field-names gis:property-names buildings-dataset
+  show field-names
+  print (word"field name are" field-names)
+
+
+
+  ; 设置世界坐标与GIS坐标的对应关系
+  gis:set-world-envelope gis:envelope-of buildings-dataset
+
+  ; 将建筑物数据绘制为瓦片
+  gis:apply-coverage buildings-dataset "ISBUILDING" IsBuilding?
+
+  ; 在建筑物位置创建建筑物智能体
+  foreach gis:feature-list-of buildings-dataset [ building-feature ->
+    let centroid gis:centroid-of building-feature
+    if centroid != nobody and centroid != false [
+      create-buildings 1 [
+        set building-id gis:property-value building-feature "id"
+        set is-covered? false
+        set shape "house"
+        set color gray
+        set size 2
+        set hidden? true
+
+
+        ; 将智能体放置于建筑物中心
+        let location gis:location-of centroid
+        if not empty? location [
+          setxy item 0 location item 1 location
+        ]
+      ]
+    ]
+  ]
+
+  ; 标记建筑物瓦片
+  ask patches gis:intersecting buildings-dataset [
+    set IsBuilding?  true
+  ]
+  ;print (word "Finds building Patches: " count patches with [IsBuilding? = 1])
+  ;print (word "Finds non-building Patches: " count patches with [IsBuilding? != 1])
+
+end
+
+;; 处理道路宽度(简化示例，实际应从GIS数据中获取)
+to process-road-widths
+  set buildings-dataset gis:load-dataset "buildings_50N_ext.shp"
+  gis:set-drawing-color red
+  gis:draw buildings-dataset 0.5
+
+  ask patches gis:intersecting buildings-dataset [
+    set IsBuilding?  true]
+
+
+  ; 如果您想为非道路区域（比如建筑物）设置road-width为0，可以用另一个单独的命令
+  ask patches with [IsBuilding? = true] [
+    set road-width 0
+    set pcolor red]
+  print (word "building color finished")
+  print (word "Finds building Patches: " count patches with [IsBuilding? = true])
+
+  ; 首先，将所有非建筑物区域都视为道路
+
+  ask patches with [IsBuilding? != true] [
+    set IsBuilding?  False
+  ; 检查某范围内是否有n个以上的建筑物，具体多少需试试，这里的数值可修改。合理怀疑这里的值只能写1以上的数字，若此处值小于1，则不会找到任何patch。因此只能设置单个网格的尺寸不要太大
+  let nearby-buildings count patches in-radius 1 with [IsBuilding? = true]
+
+  ; 如果X米范围内有2个以上建筑物，认为是狭窄道路
+  ifelse nearby-buildings >= 2 [
+    set pcolor green  ; 绿色表示狭窄道路
+    set road-width 2  ; 设置一个较窄的道路宽度
+  ] [
+    set pcolor blue   ; 蓝色表示宽阔道路
+    set road-width 10 ; 设置一个较宽的道路宽度
+  ]
+
+  ; 可选：计算到最近建筑物的距离，作为参考
+  let nearest-building min-one-of patches with [IsBuilding? = true] [distance myself]
+  if nearest-building != nobody [
+    let dist-to-building distance nearest-building
+    ; 可以存储这个距离以便未来使用
+    set road-width dist-to-building * 2  ; 但我们仍然使用上面的逻辑来设置颜色
+  ]
+
+  ; 统计所有道路和狭窄道路的数量
+  let road-patches patches with [IsBuilding? != true]
+  let narrow-road-patches patches with [IsBuilding? != true and pcolor = green]
+  print (word "narrow roads count" narrow-road-patches)
+]
+
+
+end
+
+
+
+  ; 创建消防车
+to set-firetruck
+  if any? firetrucks [
+    ask firetrucks [ die ]
+  ]
+  
+  create-firetrucks 1 [
+    set shape "truck"
+    set color red
+    set size 5
+    let valid-patches patches with [ IsBuilding? != true and road-width >= firetruck-width
+    ]
+    move-to one-of patches with [IsBuilding? != true and road-width >= firetruck-width]
+    set path (list patch-here)
+    set hidden? false
+  ]
+
+end
+
+
+;; 更新可达区域
+to update-accessibility
+  ; 检查是否有消防车存在
+  if not any? firetrucks [
+    user-message "没有可用的消防车！"
+    stop
+  ]
+
+  ; 获取第一辆消防车的属性
+  let target-firetruck one-of firetrucks
+  let truck-width [firetruck-width] of target-firetruck
+  let start-patch [patch-here] of target-firetruck
+
+  ; 使用patch-set加速查询
+  let road-patch-set patches with [
+    IsBuilding? != true and road-width >= truck-width
+  ]
+
+  ; 初始化所有patch的可达性
+  ask patches [ set is-accessible? false ]
+
+  ; 初始化队列和已访问集合
+  let frontier (list start-patch)
+  let visited patch-set (list start-patch)
+  ask start-patch [ set is-accessible? true ]
+
+  ; 广度优先搜索
+  while [not empty? frontier] [
+    let current first frontier
+    set frontier but-first frontier
+
+    ; 获取当前patch的邻居并处理
+    ask [neighbors4] of current [
+      if (member? self road-patch-set) and (not member? self visited) [
+        set is-accessible? true
+        set visited (patch-set visited self)
+        set frontier lput self frontier
+      ]
+    ]
+  ]
+
+  ; 更新不可达区域计数
+  set inaccessible-areas count patches with [
+    IsBuilding? != true and not is-accessible?
+  ]
+  print (word "the amount of inaccessible patches is" inaccessible-areas)
+
+  ; 可视化结果
+  ask patches [
+    ifelse IsBuilding? = true [
+      set pcolor gray
+    ] [
+      ifelse is-accessible? [
+        ifelse road-width >= truck-width [
+          set pcolor blue
+        ] [
+          set pcolor green
+        ]
+      ] [
+        set pcolor yellow
+      ]
+    ]
+  ]
+end
+
+; 随机选择火灾点
+to setup-fire-point
+  ; 方法一：用户点击地图
+;    ; 提示用户点击地图
+;  user-message "请点击地图上的位置来设置火灾点。"
+;  
+;  ; 等待用户点击
+;  while [not mouse-down?] [ wait 0.1 ]
+;  
+;  ; 获取鼠标点击的位置
+;  let clicked-patch patch mouse-xcor mouse-ycor
+;  
+;  if clicked-patch != nobody [
+;    ; 清除之前可能存在的火灾点
+;    ask patches with [is-fire?] [
+;      set pcolor black ; 或者你原本使用的背景颜色
+;      set is-fire? false
+;    ]
+;    
+;    ; 设置新的火灾点
+;    ask clicked-patch [
+;      set pcolor red
+;      set is-fire? true
+;    ]
+;  ]
+;  
+;  ; 等待鼠标释放，防止意外多次触发
+;  while [mouse-down?] [ wait 0.1 ]
+
+  
+  ; 方法二：随机选择火灾点
+  
+  ;  ; 清除现有火灾点
+  ask patches with [is-fire? = true] [
+    set is-fire? false
+    set pcolor get-original-color
+  ]
+  
+  ; 随机选择一个建筑作为火灾点
+  let fire-candidates patches with [IsBuilding? = true]
+  if any? fire-candidates [
+    ask one-of fire-candidates [
+      set is-fire? true
+      set pcolor red
+      print (word "the fire point is in: (" pxcor ", " pycor ")")
+    ]
+  ]
+end
+
+; 获取patch原始颜色的辅助函数
+to-report get-original-color
+  ifelse IsBuilding? = true [
+    report gray
+  ][
+    ifelse is-accessible? [
+      ifelse road-width >= [firetruck-width] of one-of firetrucks [
+        report blue
+      ][
+        report green
+      ]
+    ][
+      report yellow
+    ]
+  ]
+end
+
+; 创建消防车智能体
+to setup-firetrucks
+  ; 清除现有消防车
+  ask firetrucks [ die ]
+  
+  ; 创建新消防车
+  create-firetrucks 1 [
+    set shape "truck"
+    set color red
+    set size 5
+    set firetruck-width firetruck-width
+    
+    ; 将消防车放置在随机的可达道路上
+    let valid-patches patches with [
+      IsBuilding? != true and is-accessible? = true
+    ]
+    
+    if any? valid-patches [
+      move-to one-of valid-patches
+    ]
+  ]
+  
+  print (word "firetrucks put successfully")
+  
+  ; 更新路径可视化
+  update-accessibility
+end
+
+; 移动消防车到火灾点
+to move-firetrucks-to-fire
+  ; 重置计时和路径
+  set travel-time 0
+  
+  ; 检查是否有火灾点
+  if not any? patches with [is-fire? = true] [
+    user-message "no fire point, please set！"
+    stop
+  ]
+  
+  ; 检查是否有消防车
+  if not any? firetrucks [
+    user-message "no fire struck, please set！"
+    stop
+  ]
+  
+  ; 获取火灾点
+  let fire-patch one-of patches with [is-fire? = true]
+  
+  ; 计算每辆消防车到火灾点的路径
+  ask firetrucks [
+    ; 重置路径
+    set path []
+    
+    ; 计算从消防车当前位置到火灾点的路径
+    ; 注意：我们找到火灾点的相邻可通行点
+    let target-patches (list fire-patch)
+    if not [is-accessible?] of fire-patch [
+      set target-patches [neighbors4 with [is-accessible?]] of fire-patch
+    ]
+    
+    ifelse not empty? target-patches [
+      ; 对于每个可能的目标点，寻找路径并选择最短的
+      let shortest-path []
+      let min-path-length 99999
+      
+      foreach target-patches [ target ->
+        let current-path find-path patch-here target
+        if not empty? current-path and (empty? shortest-path or length current-path < min-path-length) [
+          set shortest-path current-path
+          set min-path-length length current-path
+        ]
+      ]
+      set path shortest-path
+      print (word "find the path, its length: " length path)
+    ][
+      print "can not find the path"
+      set path []
+    ]
+  ]
+     
+  
+  ; 开始移动
+  set simulation-running? true
+end
+
+; 模拟每一步
+to go
+  if not simulation-running? [ stop ]
+  ; 定义火灾点的到达半径
+  let arrival-radius 3  ; 例如3个patch范围内算作到达
+  
+  ; 增加时间
+  set travel-time travel-time + 1
+  print (word "No" travel-time "exp" )
+  
+  ; 移动每辆消防车
+  let all-arrived? true
+  let fire-patch one-of patches with [is-fire? = true]
+  
+  ask firetrucks [
+    ; 如果还有路径要走
+    ifelse not empty? path [
+      ; 移动到路径上的下一个点
+      move-to first path
+      set path but-first path
+      set all-arrived? false
+      
+      ; 检查是否到达火灾点或其相邻位置
+      if distance fire-patch <= arrival-radius [
+        ; 到达火灾点或相邻位置，记录时间并停止
+        set arrival-time travel-time
+        set path [] ; 清空路径表示已到达
+        print (word "arrived fire point, using: " arrival-time "steps")
+      ]
+    ][
+      ; 路径已走完，检查是否已到达火灾点或相邻位置
+      ifelse distance fire-patch <= arrival-radius [
+        ; 已到达火灾点或相邻位置
+        if arrival-time = 0 [ ; 避免重复设置
+          set arrival-time travel-time
+          print (word "arrived fire point neighbors, using: " arrival-time "steps")
+        ]
+      ][
+        ; 路径走完但未到达火灾点，说明无法到达
+        if arrival-time = 0 [ ; 避免重复设置
+          set arrival-time 9999
+          print "can't arrive fire point"
+        ]
+      ]
+    ]
+  ]
+  
+  ; 如果所有消防车都已到达或无法到达
+  if all? firetrucks [empty? path] [
+    set simulation-running? false
+    
+    ; 输出结果
+    ask firetrucks [
+      ifelse arrival-time = 9999 [
+        print (word "No: " travel-time " | can't arrive fire point")
+      ][
+        print (word  "No: " travel-time " | arrived fire point neighbors, using: " arrival-time "步")
+      ]
+    ]
+  ]
+  
+  ; 设置最大模拟时间限制，避免无限循环
+  if travel-time > 1000 [
+    set simulation-running? false
+    user-message "time out"
+    ask firetrucks [ set arrival-time 9999 ]
+  ]
+end
+
+
+; 使用A*算法寻找最短路径
+to-report find-path [start-patch end-patch]
+  ; 如果开始和结束点相同，直接返回
+  if start-patch = end-patch [ report (list end-patch) ]
+  
+  ; 创建开放列表和闭合列表
+  let open-list (list start-patch)
+  let closed-list []
+  let came-from table:make
+  let g-scores table:make
+  let f-scores table:make
+  
+  ; 辅助函数：将patch转换为有效的表键（使用坐标列表）
+  
+  
+  ; 设置起始点的分数
+  table:put g-scores (patch-key start-patch) 0 
+  table:put f-scores (patch-key start-patch) ([distance end-patch] of start-patch)
+  
+  while [not empty? open-list] [
+    ; 找到f值最小的节点
+    let current first open-list
+    let current-index 0
+    let index 0
+    
+    foreach open-list [ p -> 
+      if (table:get f-scores (patch-key p)) < (table:get f-scores (patch-key current)) 
+      [ 
+        set current p 
+        set current-index index 
+      ] 
+      set index index + 1 
+    ]
+    
+    ; 移除当前节点
+    set open-list remove-item current-index open-list
+    set closed-list lput current closed-list
+    
+    ; 如果到达终点，构建路径
+    if current = end-patch [
+      let result-path (list current)
+      while [current != start-patch] [
+        set current first table:get came-from (patch-key current)
+        set result-path fput current result-path
+      ]
+      report result-path
+    ]
+    
+    ; 检查所有可行的邻居
+    ask current [
+      ask neighbors4 with [
+        ; 确保邻居是可通行的路径
+        (IsBuilding? != true or self = end-patch) and
+        (not member? self closed-list) and
+        is-accessible?
+      ] [
+        ; 计算到这个邻居的新成本
+        let tentative-g-score (table:get g-scores (patch-key current)) + 1
+        
+        ; 如果该邻居不在开放列表中或者找到了更好的路径
+        ifelse not member? self open-list [
+          set open-list lput self open-list
+        ][
+          if table:has-key? g-scores (patch-key self) and 
+             tentative-g-score >= (table:get g-scores (patch-key self)) [
+            ; 这不是一个更好的路径
+            stop ; 跳过这个邻居
+          ]
+        ]
+        
+        ; 这是到目前为止发现的最佳路径，保存它
+        table:put came-from (patch-key self) (list current) ; 存储前驱节点
+        table:put g-scores (patch-key self) tentative-g-score
+        table:put f-scores (patch-key self) (tentative-g-score + distance end-patch)
+      ]
+    ]
+  ]
+  
+  ; 如果找不到路径
+  report []
+end
+
+; 辅助函数
+to-report patch-key [p]
+    report list [pxcor] of p [pycor] of p
+end
+
+; 全局实验函数，运行多次并收集数据
+to run-experiment
+  ; 初始化数据收集
+  set experiment-results []
+  
+  repeat num-trials [
+    ; 设置新的火灾点
+    setup-fire-point
+    
+    ; 重置消防车位置
+    ask firetrucks [
+      let valid-patches patches with [
+        IsBuilding? != true and road-width >= firetruck-width and is-accessible?
+      ]
+      if any? valid-patches [
+        move-to one-of valid-patches
+      ]
+    ]
+    
+    ; 移动消防车并记录结果
+    set travel-time 0
+    set simulation-running? true
+    
+    ; 运行模拟直到结束
+    while [simulation-running?] [
+      go
+    ]
+    
+    ; 收集数据
+    let trial-result []
+    ask firetrucks [
+      if arrival-time != 9999 [
+        set trial-result lput arrival-time trial-result
+    ]
+  ]
+]
+ ; 计算结果（处理可能没有有效数据的情况）
+  let reachable-count length experiment-results
+  let unreachable-count (num-trials - reachable-count)
+  
+  ; 计算平均到达时间（仅计算可到达的情况）
+  let avg-time ifelse-value (reachable-count > 0) [
+    mean experiment-results
+  ] [
+    "N/A"  ; 没有可到达的情况
+  ]
+  
+  ; 输出结果摘要
+  print (word 
+    "=== Results abstract ===\n" 
+    "experiment times: " num-trials "\n"
+    "success times: " reachable-count "\n"
+    "fail times: " unreachable-count "\n"
+    "average arrivial time: " (ifelse-value (is-number? avg-time) [precision avg-time 2] [avg-time]) "steps\n"
+    "------------------------"
+  )
+  
+  
+  
+  
+end
+
+
+
+
+
+
