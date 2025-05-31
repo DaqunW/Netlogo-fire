@@ -1,0 +1,263 @@
+extensions [gis]
+
+globals [
+  buildings-dataset    ; 建筑物GIS数据集
+  shelters-dataset    ; 避难点GIS数据集
+  roads-dataset       ; 道路GIS数据集
+  paths-dict          ; 存储每个建筑物的疏散路径
+  patch-size-meters   ; 每个patch代表的实际米数
+  fire-start-time     ; 火灾开始时间
+
+]
+
+patches-own [
+  is-building?        ; 是否是建筑物
+  is-shelter?         ; 是否是避难点
+  population         ; 建筑物人口数量
+  is-on-fire?        ; 是否着火
+  fire-time          ; 着火时间
+  is-road?           ; 是否是道路
+  building-id        ; 建筑物ID
+  path-cost          ; A*算法用：路径成本
+  total-cost         ; A*算法用：总成本
+  parent-patch       ; A*算法用：父节点
+]
+
+breed [people person]
+people-own [
+  evacuation-start-time  ; 开始疏散时间
+  evacuation-end-time    ; 到达避难点时间
+  target-shelter         ; 目标避难点
+  in-shelter?           ; 是否已到达避难点
+]
+
+to setup
+  clear-all
+  set patch-size-meters 1  ; 设置每个patch代表1米
+  set paths-dict table:make  ; 初始化路径字典
+  reset-ticks
+  setup-gis
+  setup-fire
+  calculate-all-paths    ; 为所有建筑计算疏散路径
+  generate-initial-people
+  
+end
+
+; 添加滑块变量声明
+to-report max-ticks
+  report max-iterations
+end
+
+to setup-gis
+  ; 加载GIS数据
+  set buildings-dataset gis:load-dataset "D:/Project_SHAPC/荔湾/消防/路网的多目标优化/netlogo加入疏散优化部分/用到的图层/buildings_50N_ext.shp"
+  set shelters-dataset gis:load-dataset "D:/Project_SHAPC/荔湾/消防/路网的多目标优化/netlogo加入疏散优化部分/用到的图层/Shelters_50N.shp"
+  set roads-dataset gis:load-dataset "D:/Project_SHAPC/荔湾/消防/路网的多目标优化/netlogo加入疏散优化部分/用到的图层/roads_50N.shp"
+  ; 将GIS数据映射到NetLogo空间
+  gis:set-world-envelope gis:envelope-of buildings-dataset
+  
+  ; 初始化patches属性
+  ask patches [
+    set is-building? false
+    set is-shelter? false
+    set is-on-fire? false
+    set is-road? false
+    set population 0
+  ]
+  
+  ; 标记建筑物区域并设置人口
+  gis:set-drawing-color gray
+  gis:draw buildings-dataset 1
+  foreach gis:feature-list-of buildings-dataset [ building-feature ->
+    ask patches gis:intersecting building-feature [
+      set is-building? true
+      let pop-value gis:property-value building-feature "pop"
+      ifelse pop-value != 0 and pop-value != nobody [
+        set population pop-value
+      ] [
+        set population 1
+      ]
+    ]
+  ]
+  
+  
+  ; 标记道路
+  gis:set-drawing-color white
+  gis:draw roads-dataset 1
+  ask patches gis:intersecting roads-dataset [
+    set is-road? true
+    set pcolor white
+  ]
+  
+  
+  ; 标记避难点
+  gis:set-drawing-color green
+  gis:draw shelters-dataset 1
+  ask patches gis:intersecting shelters-dataset [
+    set is-shelter? true
+    set pcolor green
+  ]
+end
+
+to setup-fire
+  ; 在建筑物中随机选择一个patch作为火灾起点
+  let building-patches patches with [is-building?]
+  if any? building-patches [
+    ask one-of building-patches [
+      set is-on-fire? true
+      set fire-time ticks
+      set pcolor red
+    ]
+  ]
+  set fire-start-time ticks
+end
+
+to spread-fire
+  ; 火灾扩散（5米范围）
+  let fire-spread-distance 5
+  let newly-burning-patches patches with [false]  ; 初始化新着火的patches集合
+  
+  ask patches with [is-on-fire?] [
+    ask patches in-radius fire-spread-distance [
+      if not is-on-fire? and is-building? [
+        ; 设置火灾状态
+        set is-on-fire? true
+        set fire-time ticks
+        set pcolor red
+        set newly-burning-patches (patch-set newly-burning-patches self)
+      ]
+    ]
+  ]
+  
+ 
+end
+
+;  if population > 0 [
+;  let current-patch self  ; 存储当前patch
+;  let pop population     ; 存储当前patch的人口数
+;  if pop > 0 [
+;    sprout-people pop [  ; 使用sprout-people而不是create-people
+;      set color yellow
+;      set size 1
+;      set evacuation-start-time ticks
+;            set in-shelter? false
+;      set target-shelter min-one-of (patches with [is-shelter?]) [distance myself]
+;    ]
+;  ]
+;  ]
+;  print "pop created"
+;end
+to move-people
+  ask people [
+    if not in-shelter? [
+      ; 获取当前位置和到目标避难点的距离
+      let current-patch patch-here
+      let current-distance distance target-shelter
+      
+      ; 定义可移动的安全patches
+      let safe-patches patches in-radius 1 with [
+        not is-on-fire? and                 ; 不在火灾区域
+        (is-road? or not is-building?)      ; 是道路或非建筑区域
+      ]
+      
+      if any? safe-patches [
+        ; 检查是否在死胡同中
+        let is-deadend (count safe-patches <= 1)  ; 只有一个或没有安全相邻patch时视为死胡同
+        
+        ifelse is-deadend [
+          ; 如果在死胡同中，允许向后移动
+          let escape-patches patches in-radius 1 with [
+            not is-on-fire? and                 ; 不在火灾区域
+            (is-road? or not is-building?)      ; 是道路或非建筑区域
+          ]
+          
+          if any? escape-patches [
+            ; 选择一个可行的逃生路径
+            let next-patch min-one-of escape-patches [
+              distance [target-shelter] of myself
+            ]
+            face next-patch
+            move-to next-patch
+          ]
+        ][
+          ; 正常移动逻辑
+          ; 找出所有不会显著增加到目标距离的patches（允许稍微绕路）
+          let distance-threshold current-distance * 1.2  ; 允许20%的绕路空间
+          let potential-patches safe-patches with [
+            [distance myself] of [target-shelter] of myself <= distance-threshold
+          ]
+          
+          ; 优先选择道路
+          let road-options potential-patches with [is-road?]
+          let chosen-patches ifelse-value (any? road-options)
+            [ road-options ]
+            [ potential-patches ]
+          
+          if any? chosen-patches [
+            ; 选择距离目标最近的patch，但也考虑周围可移动空间
+            let next-patch min-one-of chosen-patches [
+              [distance myself] of [target-shelter] of myself - (count neighbors with [not is-building?]) * 0.1
+            ]
+            
+            ; 移动到选中的patch
+            face next-patch
+            move-to next-patch
+          ]
+        ]
+      ]
+      
+      ; 检查是否到达避难点
+      if any? patches in-radius 1 with [is-shelter?] [
+        move-to one-of patches with [is-shelter?]  ; 确保完全进入避难点
+        set in-shelter? true
+        set evacuation-end-time ticks
+        set color green
+      ]
+    ]
+  ]
+end
+
+to reset-fire
+  ; 清除所有火灾状态
+  ask patches [
+    set is-on-fire? false
+    set fire-time 0
+  ]
+  ask people [die]  ; 清除所有人群
+  setup-fire        ; 重新设置火灾点
+end
+
+
+to go
+  ; 检查是否达到最大迭代次数
+  if ticks >= max-ticks [
+    print (word "已达到最大迭代次数 " max-ticks)
+    output-evacuation-times
+    stop
+  ]
+  
+  ; 检查是否所有人都已到达避难点
+  if all? people [in-shelter?] [
+    print (word "所有人已安全疏散，用时 " ticks " 步")
+    output-evacuation-times
+    stop
+  ]
+  
+  ; 移动所有人群
+  move-people
+  tick
+end
+
+to output-evacuation-times
+     print "疏散统计信息："
+     print (word "总疏散时间: " ticks " 步")
+     print (word "已到达避难点的人数: " count people with [in-shelter?])
+     print (word "未到达避难点的人数: " count people with [not in-shelter?])
+     
+     ; 计算平均疏散时间
+     let evacuated-people people with [in-shelter?]
+     if any? evacuated-people [
+       let avg-time mean [evacuation-end-time - evacuation-start-time] of evacuated-people
+       print (word "平均疏散时间: " precision avg-time 2 " 步")
+     ]
+   end
